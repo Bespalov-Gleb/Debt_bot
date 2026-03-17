@@ -246,7 +246,7 @@ async def cb_add_skip_comment(cb: CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(comment="")
-    await _show_add_confirm(cb.message, state)
+    await _show_add_confirm(cb.message, state, can_edit=True)
     await cb.answer()
 
 
@@ -258,7 +258,7 @@ async def add_comment_input(message: Message, state: FSMContext):
 
     comment = (message.text or "").strip()[:500]  # Ограничение длины
     await state.update_data(comment=comment)
-    await _show_add_confirm(message, state)
+    await _show_add_confirm(message, state, can_edit=False)
 
 
 def _format_record_preview(data: dict) -> str:
@@ -277,8 +277,11 @@ def _format_record_preview(data: dict) -> str:
     return text
 
 
-async def _show_add_confirm(target, state: FSMContext):
-    """Показать экран подтверждения добавления записи."""
+async def _show_add_confirm(target, state: FSMContext, can_edit: bool = True):
+    """
+    Показать экран подтверждения добавления записи.
+    can_edit=False — когда target это сообщение пользователя (нельзя редактировать).
+    """
     data = await state.get_data()
     await state.set_state(AddRecord.confirm)
     kb = InlineKeyboardBuilder()
@@ -287,7 +290,7 @@ async def _show_add_confirm(target, state: FSMContext):
     kb.adjust(1)
     text = _format_record_preview(data)
     parse_mode = "Markdown"
-    if hasattr(target, "edit_text"):
+    if can_edit:
         await target.edit_text(text, reply_markup=kb.as_markup(), parse_mode=parse_mode)
     else:
         await target.answer(text, reply_markup=kb.as_markup(), parse_mode=parse_mode)
