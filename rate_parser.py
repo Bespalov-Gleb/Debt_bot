@@ -21,15 +21,28 @@ RATE_PATTERN = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB[\s\S]{0,80}?(?:Альфа
 RATE_PATTERN_FALLBACK = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB", re.I)
 
 
+def _get_connector():
+    """HTTP-коннектор с прокси (для доступа к BestChange с сервера)."""
+    from config import PROXY
+    if PROXY:
+        from aiohttp_socks import ProxyConnector
+        return ProxyConnector.from_url(PROXY)
+    return aiohttp.TCPConnector()
+
+
 def _get_rate_via_api() -> float | None:
     """
-    bestchange-api: загружает bm_cy.zip с BestChange, парсит без HTML.
-    BestChange — .ru, доступен без прокси. Прокси только для Telegram.
+    bestchange-api: загружает bm_cy.zip с BestChange.
+    С прокси — bestchange-api может не поддерживать SOCKS5, тогда полагаемся на HTML.
     """
     try:
         from bestchange_api import BestChange
+        from config import PROXY
 
-        api = BestChange()  # без прокси: BestChange доступен из РФ напрямую
+        kwargs = {}
+        if PROXY:
+            kwargs["proxy"] = PROXY  # socks5://... или http://...
+        api = BestChange(**kwargs)
         if api.is_error():
             logger.warning("Парсер API: ошибка загрузки данных — %s", api.is_error())
             return None
@@ -66,8 +79,8 @@ def _get_rate_via_api() -> float | None:
 
 
 async def _get_rate_via_html() -> float | None:
-    """HTML-парсинг (fallback). BestChange — без прокси (доступен из РФ)."""
-    connector = aiohttp.TCPConnector()  # без прокси
+    """HTML-парсинг (fallback). Использует прокси из .env."""
+    connector = _get_connector()
     timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -101,19 +114,19 @@ async def _get_rate_via_html() -> float | None:
 async def get_usdt_to_rub_rate() -> float | None:
     """
     Получить лучший курс 1 USDT = X RUB.
-    1. bestchange-api (надёжно, без HTML)
-    2. HTML-парсинг (fallback)
+    1. HTML (aiohttp + proxy, стабильно с SOCKS5)
+    2. API (fallback, может дать 502 через прокси)
     """
-    logger.info("Парсер: запрос курса (API → HTML)")
+    logger.info("Парсер: запрос курса (HTML → API)")
+
+    rate = await _get_rate_via_html()
+    if rate is not None:
+        return rate
 
     loop = asyncio.get_event_loop()
     rate = await loop.run_in_executor(None, _get_rate_via_api)
     if rate is not None:
         return rate
 
-    rate = await _get_rate_via_html()
-    if rate is not None:
-        return rate
-
-    logger.warning("Парсер: курс не найден (ни API, ни HTML)")
+    logger.warning("Парсер: курс не найден (ни HTML, ни API)")
     return None
