@@ -1,11 +1,11 @@
 # Бот учёта долгов (USDT → RUB)
 
-Telegram-бот для фиксации долгов в USDT с конвертацией в рубли по курсу BestChange (Альфа-Банк RUB ↔ TRC-20).
+Telegram-бот для фиксации долгов в USDT с конвертацией в рубли по курсу Binance.
 
 ## Возможности
 
 - **Общая сумма долга** (в рублях) — в начале списка
-- **Добавление записей**: ввод суммы в USDT → авто-конвертация по курсу BestChange
+- **Добавление записей**: ввод суммы в USDT → авто-конвертация по курсу Binance
 - **Список долгов**: отметка записей как оплаченных
 - **История**: оплаченные записи с возможностью удаления
 - **Белый список**: только указанные Telegram ID имеют доступ
@@ -14,12 +14,6 @@ Telegram-бот для фиксации долгов в USDT с конверта
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install chromium
-```
-
-На Linux-сервере может потребоваться установка системных зависимостей:
-```bash
-python -m playwright install-deps chromium
 ```
 
 ## Настройка
@@ -44,6 +38,5 @@ python bot.py
 
 ## Курс
 
-Курс берётся с [BestChange](https://www.bestchange.ru/alfaclick-to-tether-trc20.html): Альфа-Банк RUB → USDT TRC-20 (покупка USDT за рубли).  
-Используется Playwright (headless Chromium) — надёжный парсинг через прокси. Резерв: HTML (aiohttp) и bestchange-api.  
-Если авто-получение курса не сработает, можно ввести сумму в рублях вручную.
+Курс берётся с [Binance API](https://www.binance.com/en/price/tether/RUB).  
+Если Binance недоступен — добавьте в .env: `DEBT_BOT_RATE=83.5`
