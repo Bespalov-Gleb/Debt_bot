@@ -3,8 +3,11 @@
 Направление: отдаём рубли, получаем USDT (покупка — 1 USDT = X RUB).
 Лучший курс = МИНИМУМ рублей за 1 USDT.
 """
+import logging
 import re
 import aiohttp
+
+logger = logging.getLogger(__name__)
 
 # alfaclick = Альфа-Банк (206 обменников). alfabank-cash-in пуст.
 BESTCHANGE_URL = "https://www.bestchange.ru/alfaclick-to-tether-trc20.html"
@@ -27,26 +30,45 @@ async def get_usdt_to_rub_rate() -> float | None:
     Получить лучший курс 1 USDT = X RUB.
     Направление: покупка USDT за рубли. Лучший = МИНИМУМ руб. за 1 USDT.
     """
+    logger.info("Парсер: запрос курса с %s", BESTCHANGE_URL)
     connector = _get_connector()
     timeout = aiohttp.ClientTimeout(total=10)
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        async with session.get(BESTCHANGE_URL) as resp:
-            if resp.status != 200:
-                return None
-            html = await resp.text()
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get(BESTCHANGE_URL) as resp:
+                if resp.status != 200:
+                    logger.warning("Парсер: HTTP %s вместо 200", resp.status)
+                    return None
+                html = await resp.text()
+    except aiohttp.ClientError as e:
+        logger.warning("Парсер: ошибка запроса — %s: %s", type(e).__name__, e)
+        return None
+    except Exception as e:
+        logger.exception("Парсер: неожиданная ошибка — %s", e)
+        return None
 
-    # Только курс из таблицы: формат 81.99 или 137.50 (руб за 1 USDT)
+    matches = list(RATE_PATTERN.finditer(html))
+    logger.debug("Парсер: найдено совпадений по regex: %s", len(matches))
+
     rates = []
-    for m in RATE_PATTERN.finditer(html):
+    for m in matches:
         try:
             v = float(m.group(1).replace(",", "."))
-            if 70 <= v <= 130:  # Реалистичный курс USDT (отсекаем резервы в тыс.)
+            if 70 <= v <= 130:
                 rates.append(v)
+            else:
+                logger.debug("Парсер: отброшено (вне 70–130): %s", v)
         except ValueError:
             continue
 
     if not rates:
+        logger.warning(
+            "Парсер: курс не найден. Совпадений: %s, подошедших по диапазону: 0",
+            len(matches),
+        )
         return None
-    # Лучший = МИНИМУМ рублей за 1 USDT
-    return round(min(rates), 2)
+
+    result = round(min(rates), 2)
+    logger.info("Парсер: курс %s ₽ (найдено %s значений)", result, len(rates))
+    return result
