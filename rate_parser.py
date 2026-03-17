@@ -46,7 +46,8 @@ async def get_usdt_to_rub_rate() -> float | None:
                 if resp.status != 200:
                     logger.warning("Парсер: HTTP %s вместо 200", resp.status)
                     return None
-                html = await resp.text()
+                # BestChange отдаёт страницу в windows-1251, иначе кириллица ломается
+                html = await resp.text(encoding="windows-1251")
     except aiohttp.ClientError as e:
         logger.warning("Парсер: ошибка запроса — %s: %s", type(e).__name__, e)
         return None
