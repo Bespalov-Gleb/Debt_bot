@@ -319,8 +319,7 @@ async def cb_add_confirm(cb: CallbackQuery, state: FSMContext):
     rid = await add_record(usdt, rub, rate, comment)
     await state.clear()
     await cb.answer(f"✅ Запись #{rid} добавлена")
-    # Возврат в меню
-    await cb_menu(cb)
+    await cb_menu(cb, state)
 
 
 @router.callback_query(F.data == "history")
