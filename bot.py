@@ -5,6 +5,7 @@ import logging
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -67,6 +68,15 @@ def _fmt_comment(s: str) -> str:
     return s.replace("\\", "\\\\").replace("`", "\\`").replace("_", "\\_").replace("*", "\\*")
 
 
+async def _safe_edit(message, text, **kwargs):
+    """edit_text с игнорированием ошибки «сообщение не изменилось»."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
 # --- Handlers ---
 
 
@@ -107,7 +117,7 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
     kb.button(text="➕ Добавить запись", callback_data="add")
     kb.button(text="📜 История", callback_data="history")
     kb.adjust(1)
-    await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
     await cb.answer()
 
 
@@ -124,7 +134,7 @@ async def cb_list(cb: CallbackQuery):
         text = f"💰 *Долг: {fmt_sum(debt)} ₽*\n\nЗаписей пока нет."
         kb = InlineKeyboardBuilder()
         kb.button(text="◀ В меню", callback_data="menu")
-        await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+        await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
         await cb.answer()
         return
 
@@ -139,11 +149,7 @@ async def cb_list(cb: CallbackQuery):
     kb.button(text="◀ В меню", callback_data="menu")
     kb.adjust(1)
 
-    await cb.message.edit_text(
-        "\n".join(lines),
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown",
-    )
+    await _safe_edit(cb.message, "\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
     await cb.answer()
 
 
@@ -176,7 +182,7 @@ async def cb_pay(cb: CallbackQuery):
             kb.button(text="◀ В меню", callback_data="menu")
             text = "\n".join(lines)
         kb.adjust(1)
-        await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+        await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
     else:
         await cb.answer("❌ Запись не найдена или уже оплачена")
 
@@ -188,9 +194,7 @@ async def cb_add_start(cb: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(AddRecord.wait_usdt)
-    await cb.message.edit_text(
-        "Введите сумму в USDT (например: 50 или 123.45):",
-    )
+    await _safe_edit(cb.message, "Введите сумму в USDT (например: 50 или 123.45):")
     await cb.answer()
 
 
@@ -291,7 +295,7 @@ async def _show_add_confirm(target, state: FSMContext, can_edit: bool = True):
     text = _format_record_preview(data)
     parse_mode = "Markdown"
     if can_edit:
-        await target.edit_text(text, reply_markup=kb.as_markup(), parse_mode=parse_mode)
+        await _safe_edit(target, text, reply_markup=kb.as_markup(), parse_mode=parse_mode)
     else:
         await target.answer(text, reply_markup=kb.as_markup(), parse_mode=parse_mode)
 
@@ -334,7 +338,7 @@ async def cb_history(cb: CallbackQuery):
         text = "История пуста."
         kb = InlineKeyboardBuilder()
         kb.button(text="◀ В меню", callback_data="menu")
-        await cb.message.edit_text(text, reply_markup=kb.as_markup())
+        await _safe_edit(cb.message, text, reply_markup=kb.as_markup())
         await cb.answer()
         return
 
@@ -349,11 +353,7 @@ async def cb_history(cb: CallbackQuery):
     kb.button(text="◀ В меню", callback_data="menu")
     kb.adjust(1)
 
-    await cb.message.edit_text(
-        "\n".join(lines),
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown",
-    )
+    await _safe_edit(cb.message, "\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
     await cb.answer()
 
 
@@ -382,7 +382,7 @@ async def cb_delete(cb: CallbackQuery):
             text = "\n".join(lines)
         kb.button(text="◀ В меню", callback_data="menu")
         kb.adjust(1)
-        await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+        await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
     else:
         await cb.answer("❌ Запись не найдена")
 
