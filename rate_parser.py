@@ -21,28 +21,15 @@ RATE_PATTERN = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB[\s\S]{0,80}?(?:Альфа
 RATE_PATTERN_FALLBACK = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB", re.I)
 
 
-def _get_connector():
-    from config import PROXY
-    if PROXY:
-        from aiohttp_socks import ProxyConnector
-        return ProxyConnector.from_url(PROXY)
-    return aiohttp.TCPConnector()
-
-
 def _get_rate_via_api() -> float | None:
     """
     bestchange-api: загружает bm_cy.zip с BestChange, парсит без HTML.
-    Нет проблем с кодировкой и разметкой.
+    BestChange — .ru, доступен без прокси. Прокси только для Telegram.
     """
     try:
         from bestchange_api import BestChange
-        from config import PROXY
 
-        kwargs = {}
-        if PROXY:
-            kwargs["proxy"] = {"http": PROXY, "https": PROXY}
-
-        api = BestChange(**kwargs)
+        api = BestChange()  # без прокси: BestChange доступен из РФ напрямую
         if api.is_error():
             logger.warning("Парсер API: ошибка загрузки данных — %s", api.is_error())
             return None
@@ -79,8 +66,8 @@ def _get_rate_via_api() -> float | None:
 
 
 async def _get_rate_via_html() -> float | None:
-    """HTML-парсинг (fallback). Требует windows-1251."""
-    connector = _get_connector()
+    """HTML-парсинг (fallback). BestChange — без прокси (доступен из РФ)."""
+    connector = aiohttp.TCPConnector()  # без прокси
     timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
