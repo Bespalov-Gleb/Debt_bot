@@ -12,8 +12,14 @@ logger = logging.getLogger(__name__)
 # alfaclick = Альфа-Банк (206 обменников). alfabank-cash-in пуст.
 BESTCHANGE_URL = "https://www.bestchange.ru/alfaclick-to-tether-trc20.html"
 
-# Колонка "Отдаёте": "83.1189 RUB Альфа-Банк" — руб за 1 USDT TRC20
-RATE_PATTERN = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB\s*(?:Альфа|alfabank|руб)", re.I)
+# Колонка "Отдаёте": "83.1181 RUB Альфа-Банк" — руб за 1 USDT TRC20
+# Между RUB и Альфа может быть пробел или HTML-теги
+RATE_PATTERN = re.compile(
+    r"(\d{2,3}[.,]\d{2,4})\s*RUB[\s\S]{0,80}?(?:Альфа|alfabank|Банк)",
+    re.I | re.DOTALL,
+)
+# Fallback: только число + RUB (если основной не сработал из‑за разметки)
+RATE_PATTERN_FALLBACK = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB", re.I)
 
 
 def _get_connector():
@@ -49,7 +55,12 @@ async def get_usdt_to_rub_rate() -> float | None:
         return None
 
     matches = list(RATE_PATTERN.finditer(html))
-    logger.debug("Парсер: найдено совпадений по regex: %s", len(matches))
+    if not matches:
+        matches = list(RATE_PATTERN_FALLBACK.finditer(html))
+        if matches:
+            logger.info("Парсер: основной паттерн 0 совпадений, использован fallback")
+
+    logger.debug("Парсер: найдено совпадений: %s", len(matches))
 
     rates = []
     for m in matches:
@@ -63,9 +74,11 @@ async def get_usdt_to_rub_rate() -> float | None:
             continue
 
     if not rates:
+        snippet = html[:2000] if len(html) > 2000 else html
         logger.warning(
-            "Парсер: курс не найден. Совпадений: %s, подошедших по диапазону: 0",
+            "Парсер: курс не найден. Совпадений: %s. Фрагмент ответа (первые 500 симв.): %s",
             len(matches),
+            snippet[:500].replace("\n", " "),
         )
         return None
 
