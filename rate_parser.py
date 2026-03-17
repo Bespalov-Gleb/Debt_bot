@@ -2,28 +2,26 @@
 Парсер курса Альфа-Банк RUB → USDT TRC-20 с BestChange.
 Направление: отдаём рубли, получаем USDT (покупка — 1 USDT = X RUB).
 Лучший курс = МИНИМУМ рублей за 1 USDT.
+
+Стратегия: bestchange-api (официальные данные) → HTML-парсинг (fallback).
 """
+import asyncio
 import logging
 import re
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# alfaclick = Альфа-Банк (206 обменников). alfabank-cash-in пуст.
-BESTCHANGE_URL = "https://www.bestchange.ru/alfaclick-to-tether-trc20.html"
+# bestchange-api: from=52 (alfaclick/Альфа-Банк), to=10 (USDT TRC20)
+DIR_FROM_ALFACLICK = 52
+DIR_TO_USDT_TRC20 = 10
 
-# Колонка "Отдаёте": "83.1181 RUB Альфа-Банк" — руб за 1 USDT TRC20
-# Между RUB и Альфа может быть пробел или HTML-теги
-RATE_PATTERN = re.compile(
-    r"(\d{2,3}[.,]\d{2,4})\s*RUB[\s\S]{0,80}?(?:Альфа|alfabank|Банк)",
-    re.I | re.DOTALL,
-)
-# Fallback: только число + RUB (если основной не сработал из‑за разметки)
+BESTCHANGE_URL = "https://www.bestchange.ru/alfaclick-to-tether-trc20.html"
+RATE_PATTERN = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB[\s\S]{0,80}?(?:Альфа|alfabank|Банк)", re.I | re.DOTALL)
 RATE_PATTERN_FALLBACK = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB", re.I)
 
 
 def _get_connector():
-    """HTTP-коннектор с прокси, если задан в env."""
     from config import PROXY
     if PROXY:
         from aiohttp_socks import ProxyConnector
@@ -31,37 +29,72 @@ def _get_connector():
     return aiohttp.TCPConnector()
 
 
-async def get_usdt_to_rub_rate() -> float | None:
+def _get_rate_via_api() -> float | None:
     """
-    Получить лучший курс 1 USDT = X RUB.
-    Направление: покупка USDT за рубли. Лучший = МИНИМУМ руб. за 1 USDT.
+    bestchange-api: загружает bm_cy.zip с BestChange, парсит без HTML.
+    Нет проблем с кодировкой и разметкой.
     """
-    logger.info("Парсер: запрос курса с %s", BESTCHANGE_URL)
+    try:
+        from bestchange_api import BestChange
+        from config import PROXY
+
+        kwargs = {}
+        if PROXY:
+            kwargs["proxy"] = {"http": PROXY, "https": PROXY}
+
+        api = BestChange(**kwargs)
+        if api.is_error():
+            logger.warning("Парсер API: ошибка загрузки данных — %s", api.is_error())
+            return None
+
+        rows = api.rates().filter(DIR_FROM_ALFACLICK, DIR_TO_USDT_TRC20)
+        if not rows:
+            logger.warning("Парсер API: нет курсов для направления 52→10")
+            return None
+
+        # rate_give = руб, rate_get = USDT. 1 USDT = rate_give/rate_get руб
+        rates = []
+        for r in rows:
+            try:
+                give = float(r.get("rate_give", 0))
+                get_val = float(r.get("rate_get", 0))
+                if get_val > 0:
+                    rub_per_usdt = give / get_val
+                    if 70 <= rub_per_usdt <= 130:
+                        rates.append(rub_per_usdt)
+            except (ValueError, TypeError):
+                continue
+
+        if not rates:
+            return None
+        result = min(rates)
+        logger.info("Парсер API: курс %s ₽ (из %s предложений)", round(result, 2), len(rates))
+        return round(result, 2)
+    except ImportError:
+        logger.debug("Парсер API: bestchange-api не установлен")
+        return None
+    except Exception as e:
+        logger.warning("Парсер API: ошибка — %s: %s", type(e).__name__, e)
+        return None
+
+
+async def _get_rate_via_html() -> float | None:
+    """HTML-парсинг (fallback). Требует windows-1251."""
     connector = _get_connector()
     timeout = aiohttp.ClientTimeout(total=10)
-
     try:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.get(BESTCHANGE_URL) as resp:
                 if resp.status != 200:
-                    logger.warning("Парсер: HTTP %s вместо 200", resp.status)
                     return None
-                # BestChange отдаёт страницу в windows-1251, иначе кириллица ломается
                 html = await resp.text(encoding="windows-1251")
-    except aiohttp.ClientError as e:
-        logger.warning("Парсер: ошибка запроса — %s: %s", type(e).__name__, e)
-        return None
     except Exception as e:
-        logger.exception("Парсер: неожиданная ошибка — %s", e)
+        logger.warning("Парсер HTML: ошибка запроса — %s", e)
         return None
 
     matches = list(RATE_PATTERN.finditer(html))
     if not matches:
         matches = list(RATE_PATTERN_FALLBACK.finditer(html))
-        if matches:
-            logger.info("Парсер: основной паттерн 0 совпадений, использован fallback")
-
-    logger.debug("Парсер: найдено совпадений: %s", len(matches))
 
     rates = []
     for m in matches:
@@ -69,20 +102,31 @@ async def get_usdt_to_rub_rate() -> float | None:
             v = float(m.group(1).replace(",", "."))
             if 70 <= v <= 130:
                 rates.append(v)
-            else:
-                logger.debug("Парсер: отброшено (вне 70–130): %s", v)
         except ValueError:
             continue
 
     if not rates:
-        snippet = html[:2000] if len(html) > 2000 else html
-        logger.warning(
-            "Парсер: курс не найден. Совпадений: %s. Фрагмент ответа (первые 500 симв.): %s",
-            len(matches),
-            snippet[:500].replace("\n", " "),
-        )
         return None
+    logger.info("Парсер HTML: курс %s ₽ (fallback)", round(min(rates), 2))
+    return round(min(rates), 2)
 
-    result = round(min(rates), 2)
-    logger.info("Парсер: курс %s ₽ (найдено %s значений)", result, len(rates))
-    return result
+
+async def get_usdt_to_rub_rate() -> float | None:
+    """
+    Получить лучший курс 1 USDT = X RUB.
+    1. bestchange-api (надёжно, без HTML)
+    2. HTML-парсинг (fallback)
+    """
+    logger.info("Парсер: запрос курса (API → HTML)")
+
+    loop = asyncio.get_event_loop()
+    rate = await loop.run_in_executor(None, _get_rate_via_api)
+    if rate is not None:
+        return rate
+
+    rate = await _get_rate_via_html()
+    if rate is not None:
+        return rate
+
+    logger.warning("Парсер: курс не найден (ни API, ни HTML)")
+    return None
