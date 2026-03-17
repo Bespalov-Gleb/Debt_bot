@@ -3,7 +3,7 @@
 Направление: отдаём рубли, получаем USDT (покупка — 1 USDT = X RUB).
 Лучший курс = МИНИМУМ рублей за 1 USDT.
 
-Стратегия: Playwright (headless) → HTML (aiohttp) → bestchange-api.
+Стратегия: Playwright (JS-рендер) → bestchange-api.
 """
 import asyncio
 import logging
@@ -134,8 +134,12 @@ async def _get_rate_via_playwright() -> float | None:
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 )
                 page = await context.new_page()
-                await page.goto(BESTCHANGE_URL, wait_until="load", timeout=20000)
-                await asyncio.sleep(1)  # дать JS отрендерить
+                await page.goto(BESTCHANGE_URL, wait_until="domcontentloaded", timeout=20000)
+                # Курсы подгружаются через JS — ждём появления шаблона в DOM
+                await page.wait_for_function(
+                    "() => document.body.innerText.match(/\\d{2,3}[.,]\\d{2,4}\\s*RUB/)",
+                    timeout=25000,
+                )
                 html = await page.content()
             finally:
                 await browser.close()
