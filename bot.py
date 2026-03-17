@@ -209,7 +209,7 @@ async def add_usdt_input(message: Message, state: FSMContext):
         await message.answer("Неверный формат. Введите число, например: 50")
         return
 
-    await message.answer("⏳ Получаю курс с Binance...")
+    await message.answer("⏳ Получаю курс с CoinMarketCap...")
     rate = await get_usdt_to_rub_rate()
     if rate is None:
         await message.answer(

@@ -1,11 +1,11 @@
 # Бот учёта долгов (USDT → RUB)
 
-Telegram-бот для фиксации долгов в USDT с конвертацией в рубли по курсу Binance.
+Telegram-бот для фиксации долгов в USDT с конвертацией в рубли по курсу CoinMarketCap.
 
 ## Возможности
 
 - **Общая сумма долга** (в рублях) — в начале списка
-- **Добавление записей**: ввод суммы в USDT → авто-конвертация по курсу Binance
+- **Добавление записей**: ввод суммы в USDT → авто-конвертация по курсу CoinMarketCap
 - **Список долгов**: отметка записей как оплаченных
 - **История**: оплаченные записи с возможностью удаления
 - **Белый список**: только указанные Telegram ID имеют доступ
@@ -38,5 +38,6 @@ python bot.py
 
 ## Курс
 
-Курс берётся с [Binance API](https://www.binance.com/en/price/tether/RUB).  
-Если Binance недоступен — добавьте в .env: `DEBT_BOT_RATE=83.5`
+Курс берётся с [CoinMarketCap](https://coinmarketcap.com/currencies/tether/usdt/rub/).  
+Нужен API-ключ (бесплатно): [pro.coinmarketcap.com](https://pro.coinmarketcap.com/) → добавить в .env: `DEBT_BOT_CMC_API_KEY=ваш_ключ`.  
+Fallback: Binance API, ручной курс `DEBT_BOT_RATE=83.5`

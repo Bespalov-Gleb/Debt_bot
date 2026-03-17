@@ -20,5 +20,8 @@ ALLOWED_USER_IDS: list[int] = [
     int(x.strip()) for x in _allowed.split(",") if x.strip().isdigit()
 ]
 
-# Ручной курс (если Binance недоступен): число, например 83.5
+# CoinMarketCap API key (https://pro.coinmarketcap.com/) — для курса USDT/RUB
+CMC_API_KEY = os.getenv("DEBT_BOT_CMC_API_KEY") or None
+
+# Ручной курс (fallback): число, например 83.5
 MANUAL_RATE = os.getenv("DEBT_BOT_RATE")
