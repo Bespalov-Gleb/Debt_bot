@@ -22,3 +22,6 @@ ALLOWED_USER_IDS: list[int] = [
 
 # URL BestChange: USDT TRC-20 → Альфа-Банк RUB (продажа USDT за рубли)
 BESTCHANGE_URL = "https://www.bestchange.ru/tether-trc20-to-alfabank-cash-in.html"
+
+# Ручной курс (если парсинг не сработал): число, например 83.5
+MANUAL_RATE = os.getenv("DEBT_BOT_RATE")

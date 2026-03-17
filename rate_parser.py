@@ -1,9 +1,7 @@
 """
-Парсер курса Альфа-Банк RUB → USDT TRC-20 с BestChange.
-Направление: отдаём рубли, получаем USDT (покупка — 1 USDT = X RUB).
-Лучший курс = МИНИМУМ рублей за 1 USDT.
-
-Стратегия: Playwright (JS-рендер) → bestchange-api.
+Парсер курса USDT → RUB.
+BestChange (Альфа-Банк): Playwright → bestchange-api.
+Fallback: Binance API, ручной курс из .env.
 """
 import asyncio
 import logging
@@ -163,8 +161,28 @@ async def _get_rate_via_playwright() -> float | None:
         logger.info("Парсер Playwright: курс %s ₽", round(result, 2))
         return round(result, 2)
     except Exception as e:
-        logger.warning("Парсер Playwright: ошибка — %s: %s", type(e).__name__, e)
+        logger.warning("Парсер Playwright: %s — %s", type(e).__name__, e)
         return None
+
+
+async def _get_rate_via_binance() -> float | None:
+    """Binance public API — без auth. Прокси — если задан."""
+    url = "https://api.binance.com/api/v3/ticker/price?symbol=USDTRUB"
+    connector = _get_connector()
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        price = float(data.get("price", 0))
+        if 70 <= price <= 130:
+            logger.info("Парсер Binance: курс %s ₽", round(price, 2))
+            return round(price, 2)
+    except Exception as e:
+        logger.debug("Парсер Binance: %s", e)
+    return None
 
 
 async def _get_rate_via_html() -> float | None:
@@ -202,18 +220,16 @@ async def _get_rate_via_html() -> float | None:
 
 async def get_usdt_to_rub_rate() -> float | None:
     """
-    Получить лучший курс 1 USDT = X RUB.
-    1. Playwright (headless — самый надёжный, через прокси)
-    2. HTML (aiohttp + proxy)
-    3. API (fallback)
+    Получить курс 1 USDT = X RUB.
+    Порядок: Playwright → Binance → bestchange-api → ручной из .env.
     """
-    logger.info("Парсер: запрос курса (Playwright → HTML → API)")
+    logger.info("Парсер: запрос курса (Playwright → Binance → API)")
 
     rate = await _get_rate_via_playwright()
     if rate is not None:
         return rate
 
-    rate = await _get_rate_via_html()
+    rate = await _get_rate_via_binance()
     if rate is not None:
         return rate
 
@@ -222,5 +238,15 @@ async def get_usdt_to_rub_rate() -> float | None:
     if rate is not None:
         return rate
 
-    logger.warning("Парсер: курс не найден (Playwright, HTML, API)")
+    try:
+        from config import MANUAL_RATE
+        if MANUAL_RATE:
+            r = float(MANUAL_RATE.replace(",", ".").strip())
+            if 70 <= r <= 130:
+                logger.info("Парсер: ручной курс %s ₽ (DEBT_BOT_RATE)", round(r, 2))
+                return round(r, 2)
+    except (ImportError, ValueError):
+        pass
+
+    logger.warning("Парсер: курс не найден. Добавьте DEBT_BOT_RATE=83.5 в .env")
     return None
