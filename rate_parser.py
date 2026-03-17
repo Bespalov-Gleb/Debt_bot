@@ -3,11 +3,13 @@
 Направление: отдаём рубли, получаем USDT (покупка — 1 USDT = X RUB).
 Лучший курс = МИНИМУМ рублей за 1 USDT.
 
-Стратегия: bestchange-api (официальные данные) → HTML-парсинг (fallback).
+Стратегия: Playwright (headless) → HTML (aiohttp) → bestchange-api.
 """
 import asyncio
 import logging
 import re
+from urllib.parse import urlparse
+
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,25 @@ DIR_TO_USDT_TRC20 = 10
 BESTCHANGE_URL = "https://www.bestchange.ru/alfaclick-to-tether-trc20.html"
 RATE_PATTERN = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB[\s\S]{0,80}?(?:Альфа|alfabank|Банк)", re.I | re.DOTALL)
 RATE_PATTERN_FALLBACK = re.compile(r"(\d{2,3}[.,]\d{2,4})\s*RUB", re.I)
+
+
+def _parse_proxy_for_playwright(proxy_url: str) -> dict | None:
+    """Извлечь server, username, password для Playwright (без credentials в URL)."""
+    if not proxy_url or not proxy_url.strip():
+        return None
+    try:
+        parsed = urlparse(proxy_url)
+        if not parsed.hostname or not parsed.port:
+            return None
+        server = f"{parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}"
+        out = {"server": server}
+        if parsed.username:
+            out["username"] = parsed.username
+        if parsed.password:
+            out["password"] = parsed.password
+        return out
+    except Exception:
+        return None
 
 
 def _get_connector():
@@ -79,6 +100,69 @@ def _get_rate_via_api() -> float | None:
         return None
 
 
+async def _get_rate_via_playwright() -> float | None:
+    """
+    Playwright (headless Chromium): реальный браузер, корректная кодировка и рендер.
+    Работает через прокси, даже когда aiohttp/API дают 502 или крякозябры.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.debug("Парсер Playwright: playwright не установлен")
+        return None
+
+    try:
+        from config import PROXY
+    except ImportError:
+        PROXY = None
+
+    proxy_config = _parse_proxy_for_playwright(PROXY) if PROXY else None
+
+    try:
+        async with async_playwright() as p:
+            launch_options = {
+                "headless": True,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            }
+            if proxy_config:
+                launch_options["proxy"] = proxy_config
+
+            browser = await p.chromium.launch(**launch_options)
+            try:
+                context = await browser.new_context(
+                    locale="ru-RU",
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                )
+                page = await context.new_page()
+                await page.goto(BESTCHANGE_URL, wait_until="load", timeout=20000)
+                await asyncio.sleep(1)  # дать JS отрендерить
+                html = await page.content()
+            finally:
+                await browser.close()
+
+        matches = list(RATE_PATTERN.finditer(html))
+        if not matches:
+            matches = list(RATE_PATTERN_FALLBACK.finditer(html))
+
+        rates = []
+        for m in matches:
+            try:
+                v = float(m.group(1).replace(",", "."))
+                if 70 <= v <= 130:
+                    rates.append(v)
+            except ValueError:
+                continue
+
+        if not rates:
+            return None
+        result = min(rates)
+        logger.info("Парсер Playwright: курс %s ₽", round(result, 2))
+        return round(result, 2)
+    except Exception as e:
+        logger.warning("Парсер Playwright: ошибка — %s: %s", type(e).__name__, e)
+        return None
+
+
 async def _get_rate_via_html() -> float | None:
     """HTML-парсинг (fallback). Использует прокси из .env."""
     connector = _get_connector()
@@ -115,10 +199,15 @@ async def _get_rate_via_html() -> float | None:
 async def get_usdt_to_rub_rate() -> float | None:
     """
     Получить лучший курс 1 USDT = X RUB.
-    1. HTML (aiohttp + proxy, стабильно с SOCKS5)
-    2. API (fallback, может дать 502 через прокси)
+    1. Playwright (headless — самый надёжный, через прокси)
+    2. HTML (aiohttp + proxy)
+    3. API (fallback)
     """
-    logger.info("Парсер: запрос курса (HTML → API)")
+    logger.info("Парсер: запрос курса (Playwright → HTML → API)")
+
+    rate = await _get_rate_via_playwright()
+    if rate is not None:
+        return rate
 
     rate = await _get_rate_via_html()
     if rate is not None:
@@ -129,5 +218,5 @@ async def get_usdt_to_rub_rate() -> float | None:
     if rate is not None:
         return rate
 
-    logger.warning("Парсер: курс не найден (ни HTML, ни API)")
+    logger.warning("Парсер: курс не найден (Playwright, HTML, API)")
     return None
