@@ -41,7 +41,8 @@ def _get_rate_via_api() -> float | None:
 
         kwargs = {}
         if PROXY:
-            kwargs["proxy"] = PROXY  # socks5://... или http://...
+            # requests/urllib ожидает {"http": "...", "https": "..."}
+            kwargs["proxy"] = {"http": PROXY, "https": PROXY}
         api = BestChange(**kwargs)
         if api.is_error():
             logger.warning("Парсер API: ошибка загрузки данных — %s", api.is_error())
