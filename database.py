@@ -1,11 +1,15 @@
 """
 База данных: записи долга и история.
 """
+import os
 import aiosqlite
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "debt.db"
+_env_path = os.getenv("DEBT_BOT_DB_PATH")
+DB_PATH = Path(_env_path) if _env_path else Path(__file__).parent / "debt.db"
+if _env_path:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 async def init_db():

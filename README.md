@@ -32,9 +32,17 @@ pip install -r requirements.txt
 
 ## Запуск
 
+**Локально:**
 ```bash
 python bot.py
 ```
+
+**Docker (прод, с авто-рестартом при падении):**
+```bash
+docker compose up -d --build
+```
+Логи: `docker compose logs -f`  
+Миграция: положите `debt.db` в `./data/` до первого запуска.
 
 ## Курс
 
