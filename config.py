@@ -14,11 +14,15 @@ BOT_TOKEN = os.getenv("DEBT_BOT_TOKEN", "")
 PROXY = os.getenv("DEBT_BOT_PROXY") or None
 
 # Белый список: только эти Telegram ID могут пользоваться ботом
-# DEBT_BOT_ALLOWED_IDS — строка через запятую, например: 123456789,987654321
 _allowed = os.getenv("DEBT_BOT_ALLOWED_IDS", "")
 ALLOWED_USER_IDS: list[int] = [
     int(x.strip()) for x in _allowed.split(",") if x.strip().isdigit()
 ]
+
+# Чаты для маршрутизации
+# Важно: обычно это приватные чаты (тогда chat.id = user.id).
+DEBT_BOT_MY_CHAT_ID = int(os.getenv("DEBT_BOT_MY_CHAT_ID") or 0)
+DEBT_BOT_PARTNER_CHAT_ID = int(os.getenv("DEBT_BOT_PARTNER_CHAT_ID") or 0)
 
 # CoinMarketCap API key (https://pro.coinmarketcap.com/) — для курса USDT/RUB
 CMC_API_KEY = os.getenv("DEBT_BOT_CMC_API_KEY") or None

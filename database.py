@@ -1,10 +1,14 @@
 """
-База данных: записи долга и история.
+База данных для новой логики:
+- credit: внесение долга (приход)
+- debit: погашение долга (расход), подтверждается фото чека
 """
+
 import os
-import aiosqlite
 from datetime import datetime
 from pathlib import Path
+
+import aiosqlite
 
 _env_path = os.getenv("DEBT_BOT_DB_PATH")
 DB_PATH = Path(_env_path) if _env_path else Path(__file__).parent / "debt.db"
@@ -12,89 +16,148 @@ if _env_path:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
 async def init_db():
-    """Создать таблицы."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS records (
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS credits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                usdt REAL NOT NULL,
-                rub REAL NOT NULL,
-                rate REAL NOT NULL,
-                comment TEXT DEFAULT '',
-                paid INTEGER DEFAULT 0,
+                amount_input REAL NOT NULL,
+                currency TEXT NOT NULL,
+                amount_rub REAL NOT NULL,
+                transfer_number TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
-        """)
-        # Миграция: добавить comment, если таблица создана до обновления
-        try:
-            await db.execute("ALTER TABLE records ADD COLUMN comment TEXT DEFAULT ''")
-        except Exception:
-            pass
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS debits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_or_card TEXT NOT NULL,
+                bank TEXT NOT NULL,
+                amount_rub REAL NOT NULL,
+                photo_file_id TEXT,
+                created_at TEXT NOT NULL,
+                confirmed INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        # Индексы под выборки pending/confirmed
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_debits_confirmed ON debits(confirmed, id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_credits_created_at ON credits(created_at, id)"
+        )
         await db.commit()
 
 
-async def add_record(usdt: float, rub: float, rate: float, comment: str = "") -> int:
-    """Добавить запись. Возвращает id."""
-    now = datetime.now().isoformat()
+async def add_credit(
+    amount_input: float,
+    currency: str,
+    amount_rub: float,
+    transfer_number: str,
+) -> int:
+    now = _now_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO records (usdt, rub, rate, comment, paid, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-            (usdt, rub, rate, comment or "", now),
+            """
+            INSERT INTO credits (amount_input, currency, amount_rub, transfer_number, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (amount_input, currency, amount_rub, transfer_number, now),
         )
         await db.commit()
         return cursor.lastrowid
 
 
-async def get_unpaid_records() -> list[dict]:
-    """Список неоплаченных записей."""
+async def add_debit_request(phone_or_card: str, bank: str, amount_rub: float) -> int:
+    now = _now_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO debits (phone_or_card, bank, amount_rub, photo_file_id, created_at, confirmed)
+            VALUES (?, ?, ?, NULL, ?, 0)
+            """,
+            (phone_or_card, bank, amount_rub, now),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def confirm_debit(debit_id: int, photo_file_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE debits
+            SET photo_file_id = ?, confirmed = 1
+            WHERE id = ? AND confirmed = 0
+            """,
+            (photo_file_id, debit_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_credits() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, usdt, rub, rate, COALESCE(comment, '') as comment, created_at FROM records WHERE paid = 0 ORDER BY id"
+            "SELECT id, amount_input, currency, amount_rub, transfer_number, created_at FROM credits ORDER BY id"
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
 
-async def get_total_debt_rub() -> float:
-    """Итоговая сумма долга в рублях (только неоплаченные)."""
+async def get_debits_pending(limit: int = 10) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, phone_or_card, bank, amount_rub, created_at FROM debits WHERE confirmed = 0 ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def get_debits_confirmed() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT id, phone_or_card, bank, amount_rub, photo_file_id, created_at
+            FROM debits
+            WHERE confirmed = 1
+            ORDER BY id DESC
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def get_total_credit_rub() -> float:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COALESCE(SUM(amount_rub), 0) FROM credits") as cursor:
+            row = await cursor.fetchone()
+            return row[0] or 0
+
+
+async def get_total_debit_confirmed_rub() -> float:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT COALESCE(SUM(rub), 0) FROM records WHERE paid = 0"
+            "SELECT COALESCE(SUM(amount_rub), 0) FROM debits WHERE confirmed = 1"
         ) as cursor:
             row = await cursor.fetchone()
             return row[0] or 0
 
 
-async def mark_paid(record_id: int) -> bool:
-    """Отметить запись как оплаченную (переместить в историю)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "UPDATE records SET paid = 1 WHERE id = ? AND paid = 0",
-            (record_id,),
-        )
-        await db.commit()
-        return cursor.rowcount > 0
-
-
-async def get_history() -> list[dict]:
-    """История (оплаченные записи)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id, usdt, rub, rate, COALESCE(comment, '') as comment, created_at FROM records WHERE paid = 1 ORDER BY id DESC"
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
-
-
-async def delete_from_history(record_id: int) -> bool:
-    """Удалить запись из истории."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "DELETE FROM records WHERE id = ? AND paid = 1",
-            (record_id,),
-        )
-        await db.commit()
-        return cursor.rowcount > 0
+async def get_total_debt_rub() -> float:
+    credit = await get_total_credit_rub()
+    debit = await get_total_debit_confirmed_rub()
+    return credit - debit

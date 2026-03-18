@@ -1,26 +1,47 @@
 """
-Telegram-бот для учёта долгов (USDT → RUB).
+Telegram-бот для учёта долгов в формате:
+- /credit <число> <валюта> -> номер перевода (текст)
+- /debit <номер карты/телефона> <банк> <сумма RUB> -> запрос в твой чат -> фото чека -> запись в базу
 """
+
 import logging
+import math
+import os
+import tempfile
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
+from datetime import datetime
+
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import BOT_TOKEN, ALLOWED_USER_IDS, PROXY
+from config import (
+    BOT_TOKEN,
+    ALLOWED_USER_IDS,
+    PROXY,
+    DEBT_BOT_MY_CHAT_ID,
+    DEBT_BOT_PARTNER_CHAT_ID,
+)
 from database import (
     init_db,
-    add_record,
-    get_unpaid_records,
+    add_credit,
+    add_debit_request,
+    confirm_debit,
+    get_credits,
+    get_debits_confirmed,
+    get_debits_pending,
+    get_total_credit_rub,
+    get_total_debit_confirmed_rub,
     get_total_debt_rub,
-    mark_paid,
-    get_history,
-    delete_from_history,
 )
 from rate_parser import get_usdt_to_rub_rate
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +50,7 @@ logger = logging.getLogger(__name__)
 def _create_bot() -> Bot:
     if PROXY:
         from aiogram.client.session.aiohttp import AiohttpSession
+
         session = AiohttpSession(proxy=PROXY)
         return Bot(token=BOT_TOKEN, session=session)
     return Bot(token=BOT_TOKEN)
@@ -39,390 +61,316 @@ router = Router()
 
 
 def check_access(user_id: int) -> bool:
-    """Проверка белого списка."""
     if not ALLOWED_USER_IDS:
-        return True  # Если список пуст — разрешить всем (для первой настройки)
+        return True
     return user_id in ALLOWED_USER_IDS
 
 
-async def access_denied(message: Message):
-    await message.answer("⛔ Доступ запрещён. Ваш ID не в белом списке.")
-
-
-# --- FSM ---
-class AddRecord(StatesGroup):
-    wait_usdt = State()
-    wait_comment = State()
-    confirm = State()
-
-
-# --- Форматирование ---
 def fmt_sum(v: float) -> str:
     return f"{v:,.2f}".replace(",", " ").replace(".", ",")
 
 
-def _fmt_comment(s: str) -> str:
-    """Безопасное отображение комментария (экранирование Markdown)."""
-    if not s:
-        return ""
-    return s.replace("\\", "\\\\").replace("`", "\\`").replace("_", "\\_").replace("*", "\\*")
+def _balance_text(debt: float) -> str:
+    if debt >= 0:
+        return f"Долг: {fmt_sum(debt)} ₽"
+    return f"Плюс: {fmt_sum(abs(debt))} ₽"
 
 
-async def _safe_edit(message, text, **kwargs):
-    """edit_text с игнорированием ошибки «сообщение не изменилось»."""
+async def _safe_edit(message: Message, text: str, **kwargs):
     try:
         await message.edit_text(text, **kwargs)
     except TelegramBadRequest as e:
+        # иногда Telegram кидает 400, если содержимое не изменилось
         if "message is not modified" not in str(e):
             raise
 
 
-# --- Handlers ---
+def build_menu() -> object:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Excel", callback_data="export_excel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+class CreditStates(StatesGroup):
+    wait_transfer_number = State()
+
+
+def _parse_credit_args(text: str) -> tuple[float, str] | None:
+    parts = text.strip().split()
+    # /credit <amount> <currency>
+    if len(parts) < 3:
+        return None
+    amount_raw = parts[1].replace(",", ".")
+    currency_raw = parts[2].strip().lower()
+
+    try:
+        amount = float(amount_raw)
+        if amount <= 0:
+            return None
+    except ValueError:
+        return None
+
+    if currency_raw in {"usdt", "usd₮", "tether"}:
+        currency = "USDT"
+    elif currency_raw in {"rub", "rur", "₽", "ru"}:
+        currency = "RUB"
+    else:
+        return None
+
+    return amount, currency
+
+
+def _parse_debit_args(text: str) -> tuple[str, str, float] | None:
+    parts = text.strip().split()
+    # /debit <card_or_phone> <bank...> <amount_rub>
+    if len(parts) < 4:
+        return None
+    phone_or_card = parts[1]
+    amount_raw = parts[-1].replace(",", ".")
+    try:
+        amount_rub = float(amount_raw)
+    except ValueError:
+        return None
+    if amount_rub <= 0:
+        return None
+    bank = " ".join(parts[2:-1]).strip()
+    if not bank:
+        return None
+    return phone_or_card, bank, amount_rub
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    if message.chat.id != DEBT_BOT_MY_CHAT_ID:
+        return
     if not check_access(message.from_user.id):
-        await access_denied(message)
+        await message.answer("⛔ Доступ запрещён.")
         return
 
     await state.clear()
     debt = await get_total_debt_rub()
-    text = (
-        f"💰 *Общая сумма долга: {fmt_sum(debt)} ₽*\n\n"
-        "Выберите действие:"
+    await message.answer(
+        f"Привет.\n{_balance_text(debt)}.\n\nНажми кнопку для выгрузки Excel:",
+        reply_markup=build_menu(),
     )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Список долгов", callback_data="list")
-    kb.button(text="➕ Добавить запись", callback_data="add")
-    kb.button(text="📜 История", callback_data="history")
-    kb.adjust(1)
-    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
-@router.callback_query(F.data == "menu")
-async def cb_menu(cb: CallbackQuery, state: FSMContext):
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
-
-    await state.clear()
-    debt = await get_total_debt_rub()
-    text = (
-        f"💰 *Общая сумма долга: {fmt_sum(debt)} ₽*\n\n"
-        "Выберите действие:"
-    )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Список долгов", callback_data="list")
-    kb.button(text="➕ Добавить запись", callback_data="add")
-    kb.button(text="📜 История", callback_data="history")
-    kb.adjust(1)
-    await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
-    await cb.answer()
-
-
-@router.callback_query(F.data == "list")
-async def cb_list(cb: CallbackQuery):
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
-
-    records = await get_unpaid_records()
-    debt = await get_total_debt_rub()
-
-    if not records:
-        text = f"💰 *Долг: {fmt_sum(debt)} ₽*\n\nЗаписей пока нет."
-        kb = InlineKeyboardBuilder()
-        kb.button(text="◀ В меню", callback_data="menu")
-        await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
-        await cb.answer()
-        return
-
-    lines = [f"💰 *Общий долг: {fmt_sum(debt)} ₽*\n"]
-    kb = InlineKeyboardBuilder()
-    for r in records:
-        line = f"• #{r['id']} | {fmt_sum(r['usdt'])} USDT = {fmt_sum(r['rub'])} ₽ (курс {r['rate']})"
-        if r.get("comment"):
-            line += f"\n  _{_fmt_comment(r['comment'])}_"
-        lines.append(line)
-        kb.button(text=f"✓ Оплачено #{r['id']}", callback_data=f"pay_{r['id']}")
-    kb.button(text="◀ В меню", callback_data="menu")
-    kb.adjust(1)
-
-    await _safe_edit(cb.message, "\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("pay_"))
-async def cb_pay(cb: CallbackQuery):
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
-
-    rid = int(cb.data.split("_")[1])
-    ok = await mark_paid(rid)
-    if ok:
-        await cb.answer("✅ Запись отмечена оплаченной")
-        # Обновляем список (без повторного answer)
-        records = await get_unpaid_records()
-        debt = await get_total_debt_rub()
-        if not records:
-            text = f"💰 *Долг: {fmt_sum(debt)} ₽*\n\nВсе записи оплачены."
-            kb = InlineKeyboardBuilder()
-            kb.button(text="◀ В меню", callback_data="menu")
-        else:
-            lines = [f"💰 *Общий долг: {fmt_sum(debt)} ₽*\n"]
-            kb = InlineKeyboardBuilder()
-            for r in records:
-                line = f"• #{r['id']} | {fmt_sum(r['usdt'])} USDT = {fmt_sum(r['rub'])} ₽ (курс {r['rate']})"
-                if r.get("comment"):
-                    line += f"\n  _{_fmt_comment(r['comment'])}_"
-                lines.append(line)
-                kb.button(text=f"✓ Оплачено #{r['id']}", callback_data=f"pay_{r['id']}")
-            kb.button(text="◀ В меню", callback_data="menu")
-            text = "\n".join(lines)
-        kb.adjust(1)
-        await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
-    else:
-        await cb.answer("❌ Запись не найдена или уже оплачена")
-
-
-@router.callback_query(F.data == "add")
-async def cb_add_start(cb: CallbackQuery, state: FSMContext):
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
-
-    await state.set_state(AddRecord.wait_usdt)
-    await _safe_edit(cb.message, "Введите сумму в USDT (например: 50 или 123.45):")
-    await cb.answer()
-
-
-@router.message(AddRecord.wait_usdt, F.text)
-async def add_usdt_input(message: Message, state: FSMContext):
+@router.message(Command("credit"))
+async def cmd_credit(message: Message, state: FSMContext):
     if not check_access(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён.")
         return
 
-    text = message.text.replace(",", ".").replace(" ", "")
-    try:
-        usdt = float(text)
-        if usdt <= 0:
-            await message.answer("Введите положительное число.")
+    parsed = _parse_credit_args(message.text or "")
+    if not parsed:
+        await message.answer("Использование: /credit 276 USDT или /credit 1500 RUB")
+        return
+
+    amount_input, currency = parsed
+
+    if currency == "USDT":
+        await message.answer("⏳ Получаю курс USDT→RUB (округляю вверх до копеек)...")
+        rate = await get_usdt_to_rub_rate()
+        if rate is None:
+            await message.answer("Не удалось получить курс. Попробуй позже или используй RUB.")
             return
-    except ValueError:
-        await message.answer("Неверный формат. Введите число, например: 50")
+        d_amount = Decimal(str(amount_input))
+        d_rate = Decimal(str(rate))
+        d_rub = (d_amount * d_rate).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        amount_rub = float(d_rub)
+    else:
+        d_amount = Decimal(str(amount_input))
+        amount_rub = float(d_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    await state.clear()
+    await state.update_data(
+        credit_amount_input=amount_input,
+        credit_currency=currency,
+        credit_amount_rub=amount_rub,
+        credit_chat_id=message.chat.id,
+    )
+    await state.set_state(CreditStates.wait_transfer_number)
+    await message.answer("Дальше введи текстом номер перевода (любая строка).")
+
+
+@router.message(CreditStates.wait_transfer_number, F.text)
+async def credit_transfer_number(message: Message, state: FSMContext):
+    data = await state.get_data()
+    expected_chat_id = data.get("credit_chat_id")
+    if expected_chat_id and message.chat.id != int(expected_chat_id):
+        # игнорируем сообщения не из того чата, где была команда /credit
         return
 
-    await message.answer("⏳ Получаю курс с CoinMarketCap...")
-    rate = await get_usdt_to_rub_rate()
-    if rate is None:
-        await message.answer(
-            "Не удалось получить курс. Введите сумму в рублях вручную "
-            "(или попробуйте позже):"
+    transfer_number = (message.text or "").strip()
+    if not transfer_number:
+        await message.answer("Номер перевода не может быть пустым. Введи текстом.")
+        return
+
+    credit_id = await add_credit(
+        amount_input=float(data["credit_amount_input"]),
+        currency=str(data["credit_currency"]),
+        amount_rub=float(data["credit_amount_rub"]),
+        transfer_number=transfer_number[:2000],
+    )
+    await state.clear()
+
+    debt = await get_total_debt_rub()
+    await message.answer(
+        f"✅ Credit #{credit_id} сохранён.\n{_balance_text(debt)}.",
+        reply_markup=build_menu(),
+    )
+
+
+@router.message(Command("debit"))
+async def cmd_debit(message: Message):
+    # debit вызывает товарищ в его чате
+    if message.chat.id != DEBT_BOT_PARTNER_CHAT_ID:
+        await message.answer("Команда /debit доступна только в чате товарища.")
+        return
+
+    parsed = _parse_debit_args(message.text or "")
+    if not parsed:
+        await message.answer("Пример: /debit +7999 Сбербанк 1500")
+        return
+
+    phone_or_card, bank, amount_rub = parsed
+    debit_id = await add_debit_request(phone_or_card=phone_or_card, bank=bank, amount_rub=amount_rub)
+
+    # идём в твой чат и просим фото
+    await bot.send_message(
+        DEBT_BOT_MY_CHAT_ID,
+        "Товарищ сделал запрос оплаты.\n\n"
+        f"Запрос #{debit_id}:\n"
+        f"• Реквизит: {phone_or_card}\n"
+        f"• Банк: {bank}\n"
+        f"• Сумма: {fmt_sum(amount_rub)} ₽\n\n"
+        "Пришли фото чека оплаты в этот чат.",
+        reply_markup=build_menu(),
+    )
+    await message.answer(
+        "✅ Запрос принят. Я отправил данные в твой чат и жду фото чека."
+    )
+
+
+@router.message(F.photo)
+async def on_photo_from_my_chat(message: Message):
+    if message.chat.id != DEBT_BOT_MY_CHAT_ID:
+        return
+
+    pending = await get_debits_pending(limit=1)
+    if not pending:
+        await message.answer("Фото принято, но сейчас нет ожидающих запросов /debit.")
+        return
+
+    debit = pending[0]
+    photo_file_id = message.photo[-1].file_id
+    ok = await confirm_debit(debit_id=int(debit["id"]), photo_file_id=photo_file_id)
+    if not ok:
+        await message.answer("Не удалось подтвердить оплату (запрос уже обработан).")
+        return
+
+    debt = await get_total_debt_rub()
+
+    await message.answer(
+        f"✅ Оплата подтверждена (debit #{debit['id']}).\n{_balance_text(debt)}."
+    )
+    await bot.send_message(
+        DEBT_BOT_PARTNER_CHAT_ID,
+        f"✅ Фото чека получено. Debit #{debit['id']} подтверждён.\n{_balance_text(debt)}.",
+    )
+
+
+@router.callback_query(F.data == "export_excel")
+async def cb_export_excel(cb: CallbackQuery):
+    if cb.message.chat.id != DEBT_BOT_MY_CHAT_ID:
+        await cb.answer("Экспорт доступен только в твоём чате.", show_alert=True)
+        return
+
+    credits = await get_credits()
+    debits_pending = await get_debits_pending(limit=1000)
+    debits_confirmed = await get_debits_confirmed()
+    total_credit = await get_total_credit_rub()
+    total_debit_confirmed = await get_total_debit_confirmed_rub()
+    debt = total_credit - total_debit_confirmed
+
+    wb = Workbook()
+    # удалить дефолтный лист
+    ws_current = wb.active
+    ws_current.title = "Текущие"
+    ws_history = wb.create_sheet("История")
+
+    header_font = Font(bold=True)
+    align_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # Summary current
+    ws_current.append(["Сальдо", _balance_text(debt)])
+    ws_current.append([])
+    ws_current.append(["Приход (credit) всего, ₽", float(total_credit)])
+    ws_current.append(["Погашено (debit) подтверждено, ₽", float(total_debit_confirmed)])
+    ws_current.append(["Активные debits (ждём фото), шт", int(len(debits_pending))])
+    ws_current.append([])
+
+    ws_current.append(["Кредиты"])
+    ws_current.append(["id", "created_at", "amount_input", "currency", "amount_rub", "transfer_number"])
+    for cell in ws_current[ws_current.max_row]:
+        cell.font = header_font
+
+    for c in credits:
+        ws_current.append(
+            [c["id"], c["created_at"], c["amount_input"], c["currency"], c["amount_rub"], c["transfer_number"]]
         )
-        await state.update_data(usdt=usdt, rate=None)
-        await state.set_state(AddRecord.confirm)
-        return
 
-    rub = round(usdt * rate, 2)
-    await state.update_data(usdt=usdt, rub=rub, rate=rate)
-    await state.set_state(AddRecord.wait_comment)
+    ws_current.append([])
+    ws_current.append(["Debits pending (ждём фото)"])
+    ws_current.append(["id", "created_at", "phone_or_card", "bank", "amount_rub"])
+    for cell in ws_current[ws_current.max_row]:
+        cell.font = header_font
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⏭ Пропустить", callback_data="add_skip_comment")
-    kb.button(text="❌ Отмена", callback_data="menu")
-    kb.adjust(1)
+    for d in debits_pending:
+        ws_current.append([d["id"], d["created_at"], d["phone_or_card"], d["bank"], d["amount_rub"]])
 
-    await message.answer(
-        f"📊 *Курс:* 1 USDT = {rate} ₽\n"
-        f"📊 *Сумма:* {fmt_sum(usdt)} USDT = *{fmt_sum(rub)} ₽*\n\n"
-        "Комментарий (необязательно). Напишите текст или нажмите «Пропустить»:",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown",
-    )
+    # History sheet: only confirmed debits
+    ws_history.append(["История: подтвержденные дебиты"])
+    ws_history.append(["id", "created_at", "phone_or_card", "bank", "amount_rub", "photo_file_id"])
+    for cell in ws_history[ws_history.max_row]:
+        cell.font = header_font
 
+    for d in debits_confirmed:
+        ws_history.append(
+            [d["id"], d["created_at"], d["phone_or_card"], d["bank"], d["amount_rub"], d["photo_file_id"]]
+        )
 
-@router.callback_query(AddRecord.wait_comment, F.data == "add_skip_comment")
-async def cb_add_skip_comment(cb: CallbackQuery, state: FSMContext):
-    """Пропуск комментария — переход к подтверждению."""
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
+    # autosize (примерно)
+    for ws in (ws_current, ws_history):
+        for col in range(1, ws.max_column + 1):
+            width = 12
+            for row in range(1, ws.max_row + 1):
+                v = ws.cell(row=row, column=col).value
+                if v is None:
+                    continue
+                width = max(width, min(60, len(str(v)) + 2))
+            ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = align_left
 
-    await state.update_data(comment="")
-    await _show_add_confirm(cb.message, state, can_edit=True)
-    await cb.answer()
-
-
-@router.message(AddRecord.wait_comment, F.text)
-async def add_comment_input(message: Message, state: FSMContext):
-    """Ввод комментария."""
-    if not check_access(message.from_user.id):
-        return
-
-    comment = (message.text or "").strip()[:500]  # Ограничение длины
-    await state.update_data(comment=comment)
-    await _show_add_confirm(message, state, can_edit=False)
-
-
-def _format_record_preview(data: dict) -> str:
-    """Форматирование превью записи для подтверждения."""
-    usdt = data["usdt"]
-    rub = data.get("rub") or 0
-    rate = data.get("rate") or (rub / usdt if usdt else 0)
-    comment = data.get("comment") or ""
-    text = (
-        f"📊 *Курс:* 1 USDT = {rate} ₽\n"
-        f"📊 *Сумма:* {fmt_sum(usdt)} USDT = *{fmt_sum(rub)} ₽*"
-    )
-    if comment:
-        text += f"\n📝 *Комментарий:* {_fmt_comment(comment)}"
-    text += "\n\nПодтвердить добавление?"
-    return text
-
-
-async def _show_add_confirm(target, state: FSMContext, can_edit: bool = True):
-    """
-    Показать экран подтверждения добавления записи.
-    can_edit=False — когда target это сообщение пользователя (нельзя редактировать).
-    """
-    data = await state.get_data()
-    await state.set_state(AddRecord.confirm)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Сохранить", callback_data="add_confirm")
-    kb.button(text="❌ Отмена", callback_data="menu")
-    kb.adjust(1)
-    text = _format_record_preview(data)
-    parse_mode = "Markdown"
-    if can_edit:
-        await _safe_edit(target, text, reply_markup=kb.as_markup(), parse_mode=parse_mode)
-    else:
-        await target.answer(text, reply_markup=kb.as_markup(), parse_mode=parse_mode)
-
-
-@router.callback_query(AddRecord.confirm, F.data == "add_confirm")
-async def cb_add_confirm(cb: CallbackQuery, state: FSMContext):
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
-
-    data = await state.get_data()
-    usdt = data["usdt"]
-    rub = data.get("rub")
-    rate = data.get("rate")
-    comment = data.get("comment") or ""
-
-    if rub is None:
-        await cb.answer("Добавьте сумму в рублях через команду /add")
-        await state.clear()
-        return
-
-    if rate is None:
-        rate = rub / usdt if usdt else 0
-
-    rid = await add_record(usdt, rub, rate, comment)
-    await state.clear()
-    await cb.answer(f"✅ Запись #{rid} добавлена")
-    await cb_menu(cb, state)
-
-
-@router.callback_query(F.data == "history")
-async def cb_history(cb: CallbackQuery):
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
-
-    records = await get_history()
-
-    if not records:
-        text = "История пуста."
-        kb = InlineKeyboardBuilder()
-        kb.button(text="◀ В меню", callback_data="menu")
-        await _safe_edit(cb.message, text, reply_markup=kb.as_markup())
-        await cb.answer()
-        return
-
-    lines = ["📜 *История (оплаченные записи):*\n"]
-    kb = InlineKeyboardBuilder()
-    for r in records:
-        line = f"• #{r['id']} | {fmt_sum(r['usdt'])} USDT = {fmt_sum(r['rub'])} ₽"
-        if r.get("comment"):
-            line += f"\n  _{_fmt_comment(r['comment'])}_"
-        lines.append(line)
-        kb.button(text=f"🗑 Удалить #{r['id']}", callback_data=f"del_{r['id']}")
-    kb.button(text="◀ В меню", callback_data="menu")
-    kb.adjust(1)
-
-    await _safe_edit(cb.message, "\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("del_"))
-async def cb_delete(cb: CallbackQuery):
-    if not check_access(cb.from_user.id):
-        await cb.answer("⛔ Доступ запрещён")
-        return
-
-    rid = int(cb.data.split("_")[1])
-    ok = await delete_from_history(rid)
-    if ok:
-        await cb.answer("✅ Запись удалена")
-        records = await get_history()
-        kb = InlineKeyboardBuilder()
-        if not records:
-            text = "История пуста."
-        else:
-            lines = ["📜 *История (оплаченные записи):*\n"]
-            for r in records:
-                line = f"• #{r['id']} | {fmt_sum(r['usdt'])} USDT = {fmt_sum(r['rub'])} ₽"
-                if r.get("comment"):
-                    line += f"\n  _{_fmt_comment(r['comment'])}_"
-                lines.append(line)
-                kb.button(text=f"🗑 Удалить #{r['id']}", callback_data=f"del_{r['id']}")
-            text = "\n".join(lines)
-        kb.button(text="◀ В меню", callback_data="menu")
-        kb.adjust(1)
-        await _safe_edit(cb.message, text, reply_markup=kb.as_markup(), parse_mode="Markdown")
-    else:
-        await cb.answer("❌ Запись не найдена")
-
-
-@router.message(AddRecord.confirm, F.text)
-async def add_manual_rub(message: Message, state: FSMContext):
-    """Ручной ввод рублёвой суммы, если курс не получен."""
-    if not check_access(message.from_user.id):
-        return
-
-    data = await state.get_data()
-    if data.get("rub") is not None:
-        return  # Уже есть рублёвая сумма
-
-    text = message.text.replace(",", ".").replace(" ", "")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    tmp.close()
     try:
-        rub = float(text)
-        if rub <= 0:
-            await message.answer("Введите положительное число.")
-            return
-    except ValueError:
-        await message.answer("Неверный формат. Введите число в рублях.")
-        return
+        wb.save(tmp.name)
+        file = FSInputFile(tmp.name)
+        await cb.message.answer_document(
+            document=file,
+            caption=f"Excel выгрузка.\n{_balance_text(debt)}",
+        )
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
-    usdt = data["usdt"]
-    rate = rub / usdt if usdt else 0
-    await state.update_data(rub=rub, rate=rate)
-    await state.set_state(AddRecord.wait_comment)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⏭ Пропустить", callback_data="add_skip_comment")
-    kb.button(text="❌ Отмена", callback_data="menu")
-    kb.adjust(1)
-
-    await message.answer(
-        f"📊 *Сумма:* {fmt_sum(usdt)} USDT = *{fmt_sum(rub)} ₽*\n\n"
-        "Комментарий (необязательно). Напишите текст или нажмите «Пропустить»:",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown",
-    )
+    await cb.answer()
 
 
 async def main():
@@ -434,4 +382,5 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(main())
