@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py .
+COPY *.py ./
 
 # БД по умолчанию в /app/data (volume)
 ENV DEBT_BOT_DB_PATH=/app/data/debt.db
