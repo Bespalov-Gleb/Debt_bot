@@ -249,7 +249,7 @@ async def cmd_debit(message: Message):
         reply_markup=build_menu(),
     )
     await message.answer(
-        "✅ Запрос принят. Я отправил данные в твой чат и жду фото чека."
+        "✅ Запрос принят."
     )
 
 
@@ -295,10 +295,9 @@ async def cb_export_excel(cb: CallbackQuery):
     debt = total_credit - total_debit_confirmed
 
     wb = Workbook()
-    # удалить дефолтный лист
+    # Используем один лист
     ws_current = wb.active
     ws_current.title = "Текущие"
-    ws_history = wb.create_sheet("История")
 
     header_font = Font(bold=True)
     align_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
@@ -330,19 +329,20 @@ async def cb_export_excel(cb: CallbackQuery):
     for d in debits_pending:
         ws_current.append([d["id"], d["created_at"], d["phone_or_card"], d["bank"], d["amount_rub"]])
 
-    # History sheet: only confirmed debits
-    ws_history.append(["История: подтвержденные дебиты"])
-    ws_history.append(["id", "created_at", "phone_or_card", "bank", "amount_rub", "photo_file_id"])
-    for cell in ws_history[ws_history.max_row]:
+    # Debits confirmed (погашено) — тоже на первой странице
+    ws_current.append([])
+    ws_current.append(["Debits confirmed (погашено)"])
+    ws_current.append(["id", "created_at", "phone_or_card", "bank", "amount_rub", "photo_file_id"])
+    for cell in ws_current[ws_current.max_row]:
         cell.font = header_font
 
     for d in debits_confirmed:
-        ws_history.append(
+        ws_current.append(
             [d["id"], d["created_at"], d["phone_or_card"], d["bank"], d["amount_rub"], d["photo_file_id"]]
         )
 
     # autosize (примерно)
-    for ws in (ws_current, ws_history):
+    for ws in (ws_current,):
         for col in range(1, ws.max_column + 1):
             width = 12
             for row in range(1, ws.max_row + 1):
@@ -357,18 +357,20 @@ async def cb_export_excel(cb: CallbackQuery):
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     tmp.close()
+    # ВАЖНО: не удаляем файл сразу после отправки — иначе Telegram/aiogram
+    # может не успеть дочитать содержимое, и Excel откроется битым.
+    wb.save(tmp.name)
     try:
-        wb.save(tmp.name)
-        file = FSInputFile(tmp.name)
-        await cb.message.answer_document(
-            document=file,
-            caption=f"Excel выгрузка.\n{_balance_text(debt)}",
-        )
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
+        size = os.path.getsize(tmp.name)
+    except Exception:
+        size = -1
+    logger.info("Excel saved to %s (bytes=%s)", tmp.name, size)
+
+    file = FSInputFile(tmp.name)
+    await cb.message.answer_document(
+        document=file,
+        caption=f"Excel выгрузка.\n{_balance_text(debt)}",
+    )
 
     await cb.answer()
 
