@@ -161,3 +161,11 @@ async def get_total_debt_rub() -> float:
     credit = await get_total_credit_rub()
     debit = await get_total_debit_confirmed_rub()
     return credit - debit
+
+
+async def reset_all() -> None:
+    """Полностью очистить credit/debit историю (обнулить таблицы)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM debits")
+        await db.execute("DELETE FROM credits")
+        await db.commit()

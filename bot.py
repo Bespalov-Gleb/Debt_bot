@@ -31,6 +31,7 @@ from database import (
     add_credit,
     add_debit_request,
     confirm_debit,
+    reset_all,
     get_credits,
     get_debits_confirmed,
     get_debits_pending,
@@ -88,8 +89,19 @@ async def _safe_edit(message: Message, text: str, **kwargs):
 def build_menu() -> object:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Excel", callback_data="export_excel")
+    kb.button(text="🧹 Обнулить", callback_data="reset_start")
     kb.adjust(1)
     return kb.as_markup()
+
+
+async def _show_main_screen(target_message: Message):
+    """Обновить главное сообщение с кнопками."""
+    debt = await get_total_debt_rub()
+    await _safe_edit(
+        target_message,
+        f"💰 {_balance_text(debt)}\n\nКнопки ниже:",
+        reply_markup=build_menu(),
+    )
 
 
 class CreditStates(StatesGroup):
@@ -373,6 +385,51 @@ async def cb_export_excel(cb: CallbackQuery):
     )
 
     await cb.answer()
+
+
+@router.callback_query(F.data == "reset_start")
+async def cb_reset_start(cb: CallbackQuery):
+    if cb.message.chat.id != DEBT_BOT_MY_CHAT_ID:
+        await cb.answer("Сброс доступен только в твоём чате.", show_alert=True)
+        return
+    if not check_access(cb.from_user.id):
+        await cb.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, обнулить", callback_data="reset_confirm_yes")
+    kb.button(text="❌ Отмена", callback_data="reset_confirm_no")
+    kb.adjust(1)
+
+    await _safe_edit(
+        cb.message,
+        "Точно обнулить таблицу credit/debit?\n\nЭто удалит все записи.",
+        reply_markup=kb.as_markup(),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "reset_confirm_no")
+async def cb_reset_confirm_no(cb: CallbackQuery):
+    if cb.message.chat.id != DEBT_BOT_MY_CHAT_ID:
+        await cb.answer()
+        return
+    await _show_main_screen(cb.message)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "reset_confirm_yes")
+async def cb_reset_confirm_yes(cb: CallbackQuery):
+    if cb.message.chat.id != DEBT_BOT_MY_CHAT_ID:
+        await cb.answer()
+        return
+    if not check_access(cb.from_user.id):
+        await cb.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    await reset_all()
+    await _show_main_screen(cb.message)
+    await cb.answer("✅ Обнулено")
 
 
 async def main():
